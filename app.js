@@ -15,6 +15,8 @@ const PROTOCOL = {
 const SYMBOL_MS = 3.2;
 const CALIBRATION_SECONDS = 2;
 const LOCK_FALLBACK_SECONDS = 6;
+const MAX_INVALID_BEFORE_HEADER = 520;
+const MAX_INVALID_AFTER_HEADER = 280;
 
 const PRESETS = {
   fast: { width: 24, height: 18 },
@@ -43,6 +45,9 @@ const receiveStatus = document.getElementById("receiveStatus");
 const receiveProgress = document.getElementById("receiveProgress");
 const liveCanvas = document.getElementById("liveCanvas");
 const liveCtx = liveCanvas.getContext("2d");
+const audioScope = document.getElementById("audioScope");
+const audioScopeCtx = audioScope.getContext("2d");
+const audioLevel = document.getElementById("audioLevel");
 
 const showEmitterBtn = document.getElementById("showEmitter");
 const showReceiverBtn = document.getElementById("showReceiver");
@@ -69,6 +74,7 @@ let fallbackNoiseDisabled = false;
 let liveFrameWidth = 0;
 let liveFrameHeight = 0;
 let liveImageData = null;
+let audioLevelSmooth = 0;
 
 function setStatus(element, text, isError) {
   element.textContent = text;
@@ -84,6 +90,45 @@ function drawPlaceholder(canvasCtx, message) {
   canvasCtx.textAlign = "center";
   canvasCtx.textBaseline = "middle";
   canvasCtx.fillText(message, canvas.width / 2, canvas.height / 2);
+}
+
+function drawAudioScope(samples) {
+  const w = audioScope.width;
+  const h = audioScope.height;
+  audioScopeCtx.fillStyle = "#04130f";
+  audioScopeCtx.fillRect(0, 0, w, h);
+
+  audioScopeCtx.strokeStyle = "#1e6a5a";
+  audioScopeCtx.lineWidth = 1;
+  audioScopeCtx.beginPath();
+  audioScopeCtx.moveTo(0, h / 2);
+  audioScopeCtx.lineTo(w, h / 2);
+  audioScopeCtx.stroke();
+
+  let energy = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    energy += samples[i] * samples[i];
+  }
+  const rms = Math.sqrt(energy / Math.max(1, samples.length));
+  audioLevelSmooth = audioLevelSmooth * 0.88 + rms * 0.12;
+  const levelPct = Math.min(100, Math.round(audioLevelSmooth * 700));
+  audioLevel.textContent = `Niveau micro: ${levelPct}%`;
+
+  audioScopeCtx.strokeStyle = "#3fe0c0";
+  audioScopeCtx.lineWidth = 2;
+  audioScopeCtx.beginPath();
+  const step = Math.max(1, Math.floor(samples.length / w));
+  let x = 0;
+  for (let i = 0; i < samples.length && x < w; i += step) {
+    const y = h / 2 + samples[i] * (h * 0.44);
+    if (x === 0) {
+      audioScopeCtx.moveTo(x, y);
+    } else {
+      audioScopeCtx.lineTo(x, y);
+    }
+    x += 1;
+  }
+  audioScopeCtx.stroke();
 }
 
 function setRole(mode) {
@@ -273,9 +318,9 @@ function normalizeInputChunk(input) {
     return input;
   }
 
-  const targetRms = 0.06;
-  const gain = Math.min(12, targetRms / rms);
-  if (gain <= 1.35) {
+  const targetRms = 0.03;
+  const gain = Math.min(4, targetRms / rms);
+  if (gain <= 1.8) {
     return input;
   }
 
@@ -408,7 +453,7 @@ class AcousticSstvDecoder {
 
     const step = Math.max(4, Math.floor(this.symbolSamples / 4));
     const maxOffset = this.samples.length - needSamples;
-    const minScore = Math.floor(PROTOCOL.preambleSymbols * 0.65);
+    const minScore = Math.floor(PROTOCOL.preambleSymbols * 0.7);
     let best = null;
 
     for (let offset = this.scanStart; offset <= maxOffset; offset += step) {
@@ -418,7 +463,7 @@ class AcousticSstvDecoder {
         const pA = this.adjustedPower(start, PROTOCOL.preambleA);
         const pB = this.adjustedPower(start, PROTOCOL.preambleB);
         const expectA = i % 2 === 0;
-        if ((expectA && pA > pB * 1.08) || (!expectA && pB > pA * 1.08)) {
+        if ((expectA && pA > pB * 1.1) || (!expectA && pB > pA * 1.1)) {
           preambleScore += 1;
         }
       }
@@ -433,12 +478,12 @@ class AcousticSstvDecoder {
         const pS = this.adjustedPower(start, PROTOCOL.startFreq);
         const pA = this.adjustedPower(start, PROTOCOL.preambleA);
         const pB = this.adjustedPower(start, PROTOCOL.preambleB);
-        if (pS > Math.max(pA, pB) * 1.08) {
+        if (pS > Math.max(pA, pB) * 1.1) {
           startScore += 1;
         }
       }
 
-      if (startScore < 2) {
+      if (startScore < 3) {
         continue;
       }
 
@@ -556,7 +601,8 @@ class AcousticSstvDecoder {
 
       if (nibble === null) {
         this.invalidSymbols += 1;
-        if (this.invalidSymbols > 40) {
+        const maxInvalid = this.expectedTotal ? MAX_INVALID_AFTER_HEADER : MAX_INVALID_BEFORE_HEADER;
+        if (this.invalidSymbols > maxInvalid) {
           this.resetToSearch("Signal perdu. Nouvelle ecoute...", true);
           break;
         }
@@ -677,12 +723,14 @@ async function startReceiver() {
     calibrationComplete = false;
     noLockSeconds = 0;
     fallbackNoiseDisabled = false;
+    audioLevelSmooth = 0;
 
     processorNode.onaudioprocess = (event) => {
       if (!decoder) {
         return;
       }
       const input = event.inputBuffer.getChannelData(0);
+      drawAudioScope(input);
 
       if (!calibrationComplete) {
         const remaining = calibrationTargetSamples - calibrationCollected;
@@ -747,6 +795,8 @@ async function startReceiver() {
     setStatus(receiveStatus, "Micro actif. Calibration bruit ambiant pendant 2 secondes...", false);
     receiveProgress.textContent = "Calibration: 0%";
     drawPlaceholder(liveCtx, "Calibration 2 secondes");
+    drawPlaceholder(audioScopeCtx, "Micro en direct");
+    audioLevel.textContent = "Niveau micro: 0%";
   } catch (error) {
     stopReceiver();
     setStatus(receiveStatus, `Erreur micro: ${error.message}`, true);
@@ -783,7 +833,10 @@ function stopReceiver() {
   calibrationComplete = false;
   noLockSeconds = 0;
   fallbackNoiseDisabled = false;
+  audioLevelSmooth = 0;
   decoder = null;
+  drawPlaceholder(audioScopeCtx, "Micro inactif");
+  audioLevel.textContent = "Niveau micro: 0%";
 }
 
 async function emitImage() {
@@ -849,6 +902,8 @@ stopBtn.addEventListener("click", () => {
   stopReceiver();
   setStatus(receiveStatus, "Recever arrete.", false);
   drawPlaceholder(liveCtx, "Signal en attente");
+  drawPlaceholder(audioScopeCtx, "Micro inactif");
+  audioLevel.textContent = "Niveau micro: 0%";
 });
 
 window.addEventListener("beforeunload", () => {
@@ -860,3 +915,4 @@ window.addEventListener("beforeunload", () => {
 
 drawPlaceholder(previewCtx, "Aucune image");
 drawPlaceholder(liveCtx, "Signal en attente");
+drawPlaceholder(audioScopeCtx, "Micro inactif");

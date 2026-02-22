@@ -99,12 +99,25 @@ select {
   background: #000;
 }
 
+.scope-wrap {
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: #051a16;
+  margin-bottom: 6px;
+}
+
 canvas {
   width: 100%;
   height: auto;
   display: block;
   aspect-ratio: 4 / 3;
   image-rendering: pixelated;
+}
+
+#audioScope {
+  aspect-ratio: 5 / 1;
+  image-rendering: auto;
 }
 
 .primary,
