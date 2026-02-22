@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Emmiter SSTV</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="hero">
+      <h1>Emmiter / Recever SSTV</h1>
+      <p>Transfert d'image par son entre PC et telephone (SSTV web).</p>
+    </header>
+
+    <section class="role-switch">
+      <button id="showEmitter" class="role-btn active" type="button">Mode Emmiter</button>
+      <button id="showReceiver" class="role-btn" type="button">Mode Recever</button>
+    </section>
+
+    <section id="emitterPanel" class="panel">
+      <h2>Emmiter</h2>
+      <label class="field">
+        <span>Image a emmettre</span>
+        <input id="imageInput" type="file" accept="image/*">
+      </label>
+
+      <label class="field">
+        <span>Qualite</span>
+        <select id="qualitySelect">
+          <option value="fast">Rapide (24 x 18)</option>
+          <option value="normal" selected>Standard (32 x 24)</option>
+          <option value="slow">Precise (40 x 30)</option>
+        </select>
+      </label>
+
+      <div class="canvas-wrap">
+        <canvas id="previewCanvas" width="320" height="240"></canvas>
+      </div>
+
+      <button id="emitBtn" class="primary" type="button">Emmiter</button>
+      <p id="emitStatus" class="status">Choisis une image puis clique sur Emmiter.</p>
+    </section>
+
+    <section id="receiverPanel" class="panel hidden">
+      <h2>Recever</h2>
+      <p class="hint">Apres clic sur Recever: 2 secondes de silence pour calibrer, puis place le micro pres du haut-parleur de l'emmeteur.</p>
+      <div class="actions">
+        <button id="listenBtn" class="primary" type="button">Recever</button>
+        <button id="stopBtn" type="button">Stop</button>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="liveCanvas" width="320" height="240"></canvas>
+      </div>
+      <p id="receiveStatus" class="status">En attente du micro.</p>
+      <p id="receiveProgress" class="status subtle">Progression: 0%</p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
