@@ -15,8 +15,9 @@ const PROTOCOL = {
 const SYMBOL_MS = 3.2;
 const CALIBRATION_SECONDS = 2;
 const LOCK_FALLBACK_SECONDS = 6;
-const MAX_INVALID_BEFORE_HEADER = 520;
+const MAX_INVALID_BEFORE_HEADER = 260;
 const MAX_INVALID_AFTER_HEADER = 280;
+const HEADER_SEARCH_MAX_BYTES = 120;
 
 const PRESETS = {
   fast: { width: 24, height: 18 },
@@ -75,6 +76,7 @@ let liveFrameWidth = 0;
 let liveFrameHeight = 0;
 let liveImageData = null;
 let audioLevelSmooth = 0;
+let agcGain = 1;
 
 function setStatus(element, text, isError) {
   element.textContent = text;
@@ -318,16 +320,18 @@ function normalizeInputChunk(input) {
     return input;
   }
 
-  const targetRms = 0.03;
-  const gain = Math.min(4, targetRms / rms);
-  if (gain <= 1.8) {
+  const targetRms = 0.085;
+  const desiredGain = Math.min(28, Math.max(1, targetRms / (rms + 1e-9)));
+  agcGain = agcGain * 0.84 + desiredGain * 0.16;
+
+  if (agcGain <= 1.05) {
     return input;
   }
 
   const out = new Float32Array(input.length);
   for (let i = 0; i < input.length; i += 1) {
-    const sample = input[i] * gain;
-    out[i] = Math.max(-1, Math.min(1, sample));
+    const sample = input[i] * agcGain * 1.6;
+    out[i] = Math.tanh(sample);
   }
   return out;
 }
@@ -346,9 +350,12 @@ class AcousticSstvDecoder {
     this.bytes = [];
     this.expectedTotal = null;
     this.payloadLength = null;
+    this.emittedPayloadBytes = 0;
     this.invalidSymbols = 0;
     this.noiseFloorByFreq = Object.create(null);
     this.noiseReady = false;
+    this.lockDataStartCursor = 0;
+    this.phaseShiftTried = false;
   }
 
   setNoiseProfileFromSamples(samples) {
@@ -397,11 +404,8 @@ class AcousticSstvDecoder {
     if (!this.noiseReady) {
       return rawPower;
     }
-    const floor = this.noiseFloorByFreq[freq] || 0;
-    if (floor <= 0) {
-      return rawPower;
-    }
-    return Math.max(0, rawPower - floor * 0.7);
+    const floor = Math.max(1e-12, this.noiseFloorByFreq[freq] || 0);
+    return rawPower / (floor * 0.85 + 1e-12);
   }
 
   resetToSearch(statusText, isError) {
@@ -411,12 +415,37 @@ class AcousticSstvDecoder {
     this.bytes = [];
     this.expectedTotal = null;
     this.payloadLength = null;
+    this.emittedPayloadBytes = 0;
     this.invalidSymbols = 0;
+    this.lockDataStartCursor = 0;
+    this.phaseShiftTried = false;
     this.scanStart = Math.max(0, this.samples.length - this.symbolSamples * 6);
     if (statusText) {
       this.callbacks.onStatus(statusText, Boolean(isError));
     }
+    if (this.callbacks.onSync) {
+      this.callbacks.onSync(0);
+    }
     this.callbacks.onProgress(0);
+  }
+
+  tryPhaseShift() {
+    if (this.phaseShiftTried) {
+      return false;
+    }
+    this.phaseShiftTried = true;
+    this.decodeCursor = this.lockDataStartCursor + this.symbolSamples;
+    this.pendingNibble = null;
+    this.bytes = [];
+    this.expectedTotal = null;
+    this.payloadLength = null;
+    this.emittedPayloadBytes = 0;
+    this.invalidSymbols = 0;
+    this.callbacks.onStatus("Recalage du signal...", false);
+    if (this.callbacks.onSync) {
+      this.callbacks.onSync(0);
+    }
+    return true;
   }
 
   append(input) {
@@ -453,7 +482,7 @@ class AcousticSstvDecoder {
 
     const step = Math.max(4, Math.floor(this.symbolSamples / 4));
     const maxOffset = this.samples.length - needSamples;
-    const minScore = Math.floor(PROTOCOL.preambleSymbols * 0.7);
+    const minScore = Math.floor(PROTOCOL.preambleSymbols * 0.62);
     let best = null;
 
     for (let offset = this.scanStart; offset <= maxOffset; offset += step) {
@@ -483,7 +512,7 @@ class AcousticSstvDecoder {
         }
       }
 
-      if (startScore < 3) {
+      if (startScore < 2) {
         continue;
       }
 
@@ -501,12 +530,18 @@ class AcousticSstvDecoder {
 
     this.locked = true;
     this.decodeCursor = best.offset + (PROTOCOL.preambleSymbols + PROTOCOL.startSymbols) * this.symbolSamples;
+    this.lockDataStartCursor = this.decodeCursor;
+    this.phaseShiftTried = false;
     this.pendingNibble = null;
     this.bytes = [];
     this.expectedTotal = null;
     this.payloadLength = null;
+    this.emittedPayloadBytes = 0;
     this.invalidSymbols = 0;
     this.callbacks.onStatus("Signal detecte. Decodage en cours...", false);
+    if (this.callbacks.onSync) {
+      this.callbacks.onSync(0);
+    }
   }
 
   classifyNibble(start) {
@@ -527,7 +562,7 @@ class AcousticSstvDecoder {
     }
 
     const confidence = bestPower / (secondPower + 1e-9);
-    if (confidence < 1.02) {
+    if (confidence < 1.008) {
       return null;
     }
     return bestNibble;
@@ -535,28 +570,50 @@ class AcousticSstvDecoder {
 
   handleByte(byte) {
     this.bytes.push(byte);
-    const index = this.bytes.length - 1;
 
-    if (this.bytes.length === 7) {
-      for (let i = 0; i < PROTOCOL.magic.length; i += 1) {
-        if (this.bytes[i] !== PROTOCOL.magic[i]) {
-          this.resetToSearch("Signal invalide. Nouvelle ecoute...", true);
-          return;
+    if (!this.expectedTotal) {
+      if (this.callbacks.onSync) {
+        this.callbacks.onSync(Math.min(7, this.bytes.length));
+      }
+
+      if (this.bytes.length >= 7) {
+        const scanStart = Math.max(0, this.bytes.length - 32);
+        let headerPos = -1;
+        for (let p = scanStart; p <= this.bytes.length - 7; p += 1) {
+          if (
+            this.bytes[p] === PROTOCOL.magic[0] &&
+            this.bytes[p + 1] === PROTOCOL.magic[1] &&
+            this.bytes[p + 2] === PROTOCOL.magic[2] &&
+            this.bytes[p + 3] === PROTOCOL.magic[3]
+          ) {
+            const width = this.bytes[p + 4];
+            const height = this.bytes[p + 5];
+            const mode = this.bytes[p + 6];
+            if (mode === PROTOCOL.modeRgb && width >= 8 && height >= 8 && width <= 64 && height <= 64) {
+              headerPos = p;
+              break;
+            }
+          }
+        }
+
+        if (headerPos >= 0) {
+          if (headerPos > 0) {
+            this.bytes = this.bytes.slice(headerPos);
+          }
+          const width = this.bytes[4];
+          const height = this.bytes[5];
+          this.payloadLength = width * height * 3;
+          this.expectedTotal = 7 + this.payloadLength + 2;
+          this.emittedPayloadBytes = 0;
+          this.callbacks.onFrameStart(width, height);
         }
       }
 
-      const width = this.bytes[4];
-      const height = this.bytes[5];
-      const mode = this.bytes[6];
-      if (mode !== PROTOCOL.modeRgb || width < 8 || height < 8 || width > 64 || height > 64) {
-        this.resetToSearch("Entete non supportee. Nouvelle ecoute...", true);
-        return;
+      if (!this.expectedTotal && this.bytes.length >= HEADER_SEARCH_MAX_BYTES) {
+        if (!this.tryPhaseShift()) {
+          this.resetToSearch("Entete non detectee. Nouvelle ecoute...", true);
+        }
       }
-
-      this.payloadLength = width * height * 3;
-      this.expectedTotal = 7 + this.payloadLength + 2;
-      this.callbacks.onFrameStart(width, height);
-      return;
     }
 
     if (!this.expectedTotal) {
@@ -564,10 +621,15 @@ class AcousticSstvDecoder {
     }
 
     const payloadStart = 7;
-    const payloadEnd = payloadStart + this.payloadLength;
-    if (index >= payloadStart && index < payloadEnd) {
-      const payloadIndex = index - payloadStart;
-      this.callbacks.onPayloadByte(payloadIndex, byte, this.payloadLength);
+    const availablePayloadBytes = Math.max(
+      0,
+      Math.min(this.payloadLength, this.bytes.length - payloadStart)
+    );
+    while (this.emittedPayloadBytes < availablePayloadBytes) {
+      const payloadIndex = this.emittedPayloadBytes;
+      const payloadByte = this.bytes[payloadStart + payloadIndex];
+      this.callbacks.onPayloadByte(payloadIndex, payloadByte, this.payloadLength);
+      this.emittedPayloadBytes += 1;
     }
 
     if (this.bytes.length >= this.expectedTotal) {
@@ -579,17 +641,16 @@ class AcousticSstvDecoder {
       if (checksum === expected) {
         this.callbacks.onProgress(100);
         this.callbacks.onStatus("Image recue avec succes.", false);
-      } else {
-        this.callbacks.onStatus("Checksum invalide. Recommence l'emission.", true);
-      }
-      if (checksum === expected) {
         this.resetToSearch("En ecoute d'un nouveau signal...", false);
       } else {
+        this.callbacks.onStatus("Checksum invalide. Recommence l'emission.", true);
         this.resetToSearch("En ecoute d'un nouveau signal...", true);
       }
     } else {
-      const done = Math.max(0, this.bytes.length - 7);
-      const pct = Math.min(100, Math.round((done / (this.payloadLength || 1)) * 100));
+      const pct = Math.min(
+        100,
+        Math.round((this.emittedPayloadBytes / (this.payloadLength || 1)) * 100)
+      );
       this.callbacks.onProgress(pct);
     }
   }
@@ -707,6 +768,11 @@ async function startReceiver() {
 
     decoder = new AcousticSstvDecoder(rxAudioCtx.sampleRate, SYMBOL_MS, {
       onStatus: (text, isError) => setStatus(receiveStatus, text, isError),
+      onSync: (count) => {
+        if (decoder && !decoder.expectedTotal) {
+          receiveProgress.textContent = `Sync entete: ${Math.max(0, Math.min(7, count))}/7`;
+        }
+      },
       onProgress: (pct) => {
         receiveProgress.textContent = `Progression: ${Math.max(0, Math.min(100, pct))}%`;
       },
@@ -724,6 +790,7 @@ async function startReceiver() {
     noLockSeconds = 0;
     fallbackNoiseDisabled = false;
     audioLevelSmooth = 0;
+    agcGain = 1;
 
     processorNode.onaudioprocess = (event) => {
       if (!decoder) {
@@ -834,6 +901,7 @@ function stopReceiver() {
   noLockSeconds = 0;
   fallbackNoiseDisabled = false;
   audioLevelSmooth = 0;
+  agcGain = 1;
   decoder = null;
   drawPlaceholder(audioScopeCtx, "Micro inactif");
   audioLevel.textContent = "Niveau micro: 0%";
