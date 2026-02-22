@@ -53,6 +53,8 @@ const emitLiveCtx = emitLiveCanvas.getContext("2d");
 
 const listenBtn = document.getElementById("listenBtn");
 const stopBtn = document.getElementById("stopBtn");
+const sensitivityRange = document.getElementById("sensitivityRange");
+const sensitivityLabel = document.getElementById("sensitivityLabel");
 const receiveStatus = document.getElementById("receiveStatus");
 const receiveProgress = document.getElementById("receiveProgress");
 const receiveMeta = document.getElementById("receiveMeta");
@@ -101,6 +103,7 @@ let liveRenderScheduled = false;
 let lastProgressUiAt = 0;
 let scopeDrawToggle = 0;
 let currentDecodeRow = 0;
+let sensitivityScale = 1.0;
 
 function setStatus(element, text, isError) {
   element.textContent = text;
@@ -121,6 +124,11 @@ function drawPlaceholder(canvasCtx, message) {
   canvasCtx.textAlign = "center";
   canvasCtx.textBaseline = "middle";
   canvasCtx.fillText(message, canvas.width / 2, canvas.height / 2);
+}
+
+function getSensitivityScaleFromUi() {
+  const pct = Number(sensitivityRange.value || 100);
+  return Math.max(0.5, Math.min(2.5, pct / 100));
 }
 
 function resetEmitLiveFrame(message) {
@@ -475,8 +483,8 @@ function normalizeInputChunk(input) {
     return input;
   }
 
-  const targetRms = 0.085;
-  const desiredGain = Math.min(28, Math.max(1, targetRms / (rms + 1e-9)));
+  const targetRms = 0.085 * Math.pow(sensitivityScale, 0.55);
+  const desiredGain = Math.min(28 * Math.pow(sensitivityScale, 0.6), Math.max(1, targetRms / (rms + 1e-9)));
   agcGain = agcGain * 0.84 + desiredGain * 0.16;
 
   if (agcGain <= 1.05) {
@@ -511,6 +519,11 @@ class AcousticSstvDecoder {
     this.noiseReady = false;
     this.lockDataStartCursor = 0;
     this.phaseShiftTried = false;
+    this.sensitivity = 1.0;
+  }
+
+  setSensitivity(scale) {
+    this.sensitivity = Math.max(0.5, Math.min(2.5, scale));
   }
 
   setNoiseProfileFromSamples(samples) {
@@ -640,7 +653,10 @@ class AcousticSstvDecoder {
 
     const step = Math.max(4, Math.floor(this.symbolSamples / 4));
     const maxOffset = this.samples.length - needSamples;
-    const minScore = Math.floor(PROTOCOL.preambleSymbols * 0.62);
+    const ratioThreshold = Math.max(1.03, 1.1 - (this.sensitivity - 1) * 0.08);
+    const minScoreFactor = Math.max(0.36, 0.62 / this.sensitivity);
+    const minScore = Math.floor(PROTOCOL.preambleSymbols * minScoreFactor);
+    const startScoreRequired = this.sensitivity >= 1.85 ? 1 : 2;
     let best = null;
 
     for (let offset = this.scanStart; offset <= maxOffset; offset += step) {
@@ -650,7 +666,7 @@ class AcousticSstvDecoder {
         const pA = this.adjustedPower(start, PROTOCOL.preambleA);
         const pB = this.adjustedPower(start, PROTOCOL.preambleB);
         const expectA = i % 2 === 0;
-        if ((expectA && pA > pB * 1.1) || (!expectA && pB > pA * 1.1)) {
+        if ((expectA && pA > pB * ratioThreshold) || (!expectA && pB > pA * ratioThreshold)) {
           preambleScore += 1;
         }
       }
@@ -665,12 +681,12 @@ class AcousticSstvDecoder {
         const pS = this.adjustedPower(start, PROTOCOL.startFreq);
         const pA = this.adjustedPower(start, PROTOCOL.preambleA);
         const pB = this.adjustedPower(start, PROTOCOL.preambleB);
-        if (pS > Math.max(pA, pB) * 1.1) {
+        if (pS > Math.max(pA, pB) * ratioThreshold) {
           startScore += 1;
         }
       }
 
-      if (startScore < 2) {
+      if (startScore < startScoreRequired) {
         continue;
       }
 
@@ -720,7 +736,8 @@ class AcousticSstvDecoder {
     }
 
     const confidence = bestPower / (secondPower + 1e-9);
-    if (confidence < 1.008) {
+    const confidenceThreshold = Math.max(1.003, 1.008 - (this.sensitivity - 1) * 0.005);
+    if (confidence < confidenceThreshold) {
       return null;
     }
     return bestNibble;
@@ -833,7 +850,8 @@ class AcousticSstvDecoder {
 
       if (nibble === null) {
         this.invalidSymbols += 1;
-        const maxInvalid = this.expectedTotal ? MAX_INVALID_AFTER_HEADER : MAX_INVALID_BEFORE_HEADER;
+        const baseInvalid = this.expectedTotal ? MAX_INVALID_AFTER_HEADER : MAX_INVALID_BEFORE_HEADER;
+        const maxInvalid = Math.round(baseInvalid * (1 + (this.sensitivity - 1) * 0.85));
         if (this.invalidSymbols > maxInvalid) {
           this.resetToSearch("Signal perdu. Nouvelle ecoute...", true);
           break;
@@ -978,6 +996,7 @@ async function startReceiver() {
       onFrameStart,
       onPayloadByte
     });
+    decoder.setSensitivity(sensitivityScale);
 
     calibrationTargetSamples = Math.max(
       1,
@@ -996,6 +1015,9 @@ async function startReceiver() {
     processorNode.onaudioprocess = (event) => {
       if (!decoder) {
         return;
+      }
+      if (decoder.sensitivity !== sensitivityScale) {
+        decoder.setSensitivity(sensitivityScale);
       }
       const input = event.inputBuffer.getChannelData(0);
       scopeDrawToggle = (scopeDrawToggle + 1) % 2;
@@ -1216,6 +1238,11 @@ emitVolume.addEventListener("input", () => {
   emitVolumeLabel.textContent = `${emitVolume.value}%`;
 });
 
+sensitivityRange.addEventListener("input", () => {
+  sensitivityLabel.textContent = `${sensitivityRange.value}%`;
+  sensitivityScale = getSensitivityScaleFromUi();
+});
+
 emitBtn.addEventListener("click", emitImage);
 listenBtn.addEventListener("click", startReceiver);
 stopBtn.addEventListener("click", () => {
@@ -1240,5 +1267,7 @@ drawPlaceholder(previewCtx, "Aucune image");
 drawPlaceholder(liveCtx, "Signal en attente");
 drawPlaceholder(audioScopeCtx, "Micro inactif");
 resetEmitLiveFrame("Pret a emettre");
+sensitivityScale = getSensitivityScaleFromUi();
+sensitivityLabel.textContent = `${sensitivityRange.value}%`;
 setStageChip(emitStageChip, "Emmiter: idle", "idle");
 setStageChip(recvStageChip, "Recever: idle", "idle");
