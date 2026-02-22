@@ -9,8 +9,13 @@
 <body>
   <main class="app">
     <header class="hero">
+      <p class="hero-tag">SSTV MIAMI LINK</p>
       <h1>Emmiter / Recever SSTV</h1>
       <p>Transfert d'image par son entre PC et telephone (SSTV web).</p>
+      <div class="hero-stats">
+        <span id="emitStageChip" class="chip">Emmiter: idle</span>
+        <span id="recvStageChip" class="chip">Recever: idle</span>
+      </div>
     </header>
 
     <section class="role-switch">
@@ -39,9 +44,21 @@
         <input id="emitVolume" type="range" min="20" max="100" step="1" value="92">
       </label>
 
-      <div class="canvas-wrap">
-        <canvas id="previewCanvas" width="320" height="240"></canvas>
+      <div class="dual-canvas">
+        <figure class="canvas-block">
+          <figcaption>Image source</figcaption>
+          <div class="canvas-wrap">
+            <canvas id="previewCanvas" width="320" height="240"></canvas>
+          </div>
+        </figure>
+        <figure class="canvas-block">
+          <figcaption>Emission en direct</figcaption>
+          <div class="canvas-wrap">
+            <canvas id="emitLiveCanvas" width="320" height="240"></canvas>
+          </div>
+        </figure>
       </div>
+      <p id="emitProgress" class="status subtle">Emission: 0% | Image: 0%</p>
 
       <button id="emitBtn" class="primary" type="button">Emmiter</button>
       <p id="emitStatus" class="status">Choisis une image puis clique sur Emmiter.</p>
@@ -60,11 +77,13 @@
       </div>
       <p id="audioLevel" class="status subtle">Niveau micro: 0%</p>
 
-      <div class="canvas-wrap">
+      <div class="canvas-wrap decode-wrap">
         <canvas id="liveCanvas" width="320" height="240"></canvas>
+        <div id="decodeLine" class="decode-line"></div>
       </div>
       <p id="receiveStatus" class="status">En attente du micro.</p>
       <p id="receiveProgress" class="status subtle">Progression: 0%</p>
+      <p id="receiveMeta" class="status subtle">Ligne decodee: 0</p>
     </section>
   </main>
 

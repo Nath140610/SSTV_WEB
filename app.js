@@ -18,6 +18,11 @@ const LOCK_FALLBACK_SECONDS = 6;
 const MAX_INVALID_BEFORE_HEADER = 260;
 const MAX_INVALID_AFTER_HEADER = 280;
 const HEADER_SEARCH_MAX_BYTES = 120;
+const MAX_SYMBOLS_PER_PROCESS = 96;
+const MAX_PAYLOAD_EMIT_PER_CALL = 220;
+const MAX_SAMPLE_BUFFER_SECONDS = 14;
+const TRIM_SAMPLE_BUFFER_SECONDS = 8;
+const UI_PROGRESS_INTERVAL_MS = 80;
 
 const PRESETS = {
   fast: { width: 24, height: 18 },
@@ -39,15 +44,23 @@ const emitVolume = document.getElementById("emitVolume");
 const emitVolumeLabel = document.getElementById("emitVolumeLabel");
 const emitBtn = document.getElementById("emitBtn");
 const emitStatus = document.getElementById("emitStatus");
+const emitProgress = document.getElementById("emitProgress");
+const emitStageChip = document.getElementById("emitStageChip");
 const previewCanvas = document.getElementById("previewCanvas");
 const previewCtx = previewCanvas.getContext("2d");
+const emitLiveCanvas = document.getElementById("emitLiveCanvas");
+const emitLiveCtx = emitLiveCanvas.getContext("2d");
 
 const listenBtn = document.getElementById("listenBtn");
 const stopBtn = document.getElementById("stopBtn");
 const receiveStatus = document.getElementById("receiveStatus");
 const receiveProgress = document.getElementById("receiveProgress");
+const receiveMeta = document.getElementById("receiveMeta");
+const recvStageChip = document.getElementById("recvStageChip");
 const liveCanvas = document.getElementById("liveCanvas");
 const liveCtx = liveCanvas.getContext("2d");
+const decodeLine = document.getElementById("decodeLine");
+const decodeWrap = liveCanvas.parentElement;
 const audioScope = document.getElementById("audioScope");
 const audioScopeCtx = audioScope.getContext("2d");
 const audioLevel = document.getElementById("audioLevel");
@@ -77,14 +90,26 @@ let fallbackNoiseDisabled = false;
 let liveFrameWidth = 0;
 let liveFrameHeight = 0;
 let liveImageData = null;
+let emitLiveImageData = null;
+let emitAnimationState = null;
+let emitAnimationRaf = 0;
 let audioLevelSmooth = 0;
 let agcGain = 1;
 let currentMicLevelPct = 0;
 let weakSignalWarned = false;
+let liveRenderScheduled = false;
+let lastProgressUiAt = 0;
+let scopeDrawToggle = 0;
+let currentDecodeRow = 0;
 
 function setStatus(element, text, isError) {
   element.textContent = text;
   element.classList.toggle("error", Boolean(isError));
+}
+
+function setStageChip(chip, text, state) {
+  chip.textContent = text;
+  chip.dataset.state = state || "idle";
 }
 
 function drawPlaceholder(canvasCtx, message) {
@@ -96,6 +121,105 @@ function drawPlaceholder(canvasCtx, message) {
   canvasCtx.textAlign = "center";
   canvasCtx.textBaseline = "middle";
   canvasCtx.fillText(message, canvas.width / 2, canvas.height / 2);
+}
+
+function resetEmitLiveFrame(message) {
+  emitLiveCanvas.width = 320;
+  emitLiveCanvas.height = 240;
+  emitLiveCtx.imageSmoothingEnabled = false;
+  emitLiveImageData = null;
+  drawPlaceholder(emitLiveCtx, message || "Pret a emettre");
+  emitProgress.textContent = "Emission: 0% | Image: 0%";
+}
+
+function stopEmitAnimation(finalizePayload) {
+  if (emitAnimationRaf) {
+    cancelAnimationFrame(emitAnimationRaf);
+    emitAnimationRaf = 0;
+  }
+  if (!emitAnimationState) {
+    return;
+  }
+
+  if (finalizePayload && emitLiveImageData) {
+    const payload = emitAnimationState.payload;
+    for (let i = emitAnimationState.emittedPayloadBytes; i < payload.length; i += 1) {
+      const pixel = Math.floor(i / 3);
+      const channel = i % 3;
+      emitLiveImageData.data[pixel * 4 + channel] = payload[i];
+    }
+    emitLiveCtx.putImageData(emitLiveImageData, 0, 0);
+    emitProgress.textContent = "Emission: 100% | Image: 100%";
+  }
+
+  emitAnimationState = null;
+}
+
+function startEmitAnimation(payload, width, height, packetLength, tonesLength, symbolMs) {
+  stopEmitAnimation(false);
+
+  emitLiveCanvas.width = width;
+  emitLiveCanvas.height = height;
+  emitLiveCtx.imageSmoothingEnabled = false;
+  emitLiveImageData = emitLiveCtx.createImageData(width, height);
+  for (let i = 3; i < emitLiveImageData.data.length; i += 4) {
+    emitLiveImageData.data[i] = 255;
+  }
+  emitLiveCtx.putImageData(emitLiveImageData, 0, 0);
+
+  emitAnimationState = {
+    payload,
+    width,
+    height,
+    packetLength,
+    totalDataSymbols: packetLength * 2,
+    preambleSymbols: PROTOCOL.preambleSymbols + PROTOCOL.startSymbols,
+    symbolMs,
+    startAtMs: performance.now() + 85,
+    totalMs: tonesLength * symbolMs,
+    emittedPayloadBytes: 0
+  };
+
+  const tick = () => {
+    if (!emitAnimationState || !isEmitting) {
+      return;
+    }
+
+    const state = emitAnimationState;
+    const elapsedMs = Math.max(0, performance.now() - state.startAtMs);
+    const symbolPos = Math.floor(elapsedMs / state.symbolMs);
+    const dataSymbols = Math.max(0, Math.min(state.totalDataSymbols, symbolPos - state.preambleSymbols));
+    const dataBytes = Math.floor(dataSymbols / 2);
+    const payloadTarget = Math.min(state.payload.length, Math.max(0, dataBytes - 7));
+
+    let changed = false;
+    let updates = 0;
+    while (state.emittedPayloadBytes < payloadTarget && updates < 420) {
+      const payloadIndex = state.emittedPayloadBytes;
+      const pixel = Math.floor(payloadIndex / 3);
+      const channel = payloadIndex % 3;
+      emitLiveImageData.data[pixel * 4 + channel] = state.payload[payloadIndex];
+      state.emittedPayloadBytes += 1;
+      updates += 1;
+      changed = true;
+    }
+
+    if (changed) {
+      emitLiveCtx.putImageData(emitLiveImageData, 0, 0);
+    }
+
+    const imagePct = Math.min(100, Math.round((state.emittedPayloadBytes / state.payload.length) * 100));
+    const emissionPct = Math.min(100, Math.round((elapsedMs / state.totalMs) * 100));
+    emitProgress.textContent = `Emission: ${emissionPct}% | Image: ${imagePct}%`;
+
+    if (state.emittedPayloadBytes >= state.payload.length && elapsedMs > state.totalMs + 120) {
+      return;
+    }
+
+    emitAnimationRaf = requestAnimationFrame(tick);
+  };
+
+  emitAnimationRaf = requestAnimationFrame(tick);
 }
 
 function drawAudioScope(samples) {
@@ -136,6 +260,31 @@ function drawAudioScope(samples) {
     x += 1;
   }
   audioScopeCtx.stroke();
+}
+
+function scheduleLiveRender() {
+  if (liveRenderScheduled) {
+    return;
+  }
+  liveRenderScheduled = true;
+  requestAnimationFrame(() => {
+    liveRenderScheduled = false;
+    if (liveImageData) {
+      liveCtx.putImageData(liveImageData, 0, 0);
+    }
+  });
+}
+
+function setDecodeRow(rowIndex) {
+  currentDecodeRow = Math.max(0, Math.min(liveFrameHeight - 1, rowIndex));
+  if (liveFrameHeight > 0) {
+    receiveMeta.textContent = `Ligne decodee: ${currentDecodeRow + 1}/${liveFrameHeight}`;
+    const yPct = (currentDecodeRow / liveFrameHeight) * 100;
+    decodeLine.style.transform = `translateY(${yPct}%)`;
+  } else {
+    receiveMeta.textContent = "Ligne decodee: 0";
+    decodeLine.style.transform = "translateY(0%)";
+  }
 }
 
 function setRole(mode) {
@@ -459,13 +608,15 @@ class AcousticSstvDecoder {
       this.samples.push(input[i]);
     }
 
-    const maxSamples = Math.round(this.sampleRate * 40);
+    const maxSamples = Math.round(this.sampleRate * MAX_SAMPLE_BUFFER_SECONDS);
     if (this.samples.length > maxSamples) {
-      const cut = this.samples.length - maxSamples;
+      const trimTo = Math.round(this.sampleRate * TRIM_SAMPLE_BUFFER_SECONDS);
+      const cut = this.samples.length - trimTo;
       this.samples.splice(0, cut);
       this.scanStart = Math.max(0, this.scanStart - cut);
       if (this.locked) {
         this.decodeCursor = Math.max(0, this.decodeCursor - cut);
+        this.lockDataStartCursor = Math.max(0, this.lockDataStartCursor - cut);
       }
     }
   }
@@ -475,7 +626,8 @@ class AcousticSstvDecoder {
       this.tryLock();
     }
     if (this.locked) {
-      this.decodeSymbols();
+      this.decodeSymbols(MAX_SYMBOLS_PER_PROCESS);
+      this.flushBufferedPayload(MAX_PAYLOAD_EMIT_PER_CALL);
     }
   }
 
@@ -574,6 +726,27 @@ class AcousticSstvDecoder {
     return bestNibble;
   }
 
+  flushBufferedPayload(maxToEmit) {
+    if (!this.expectedTotal) {
+      return;
+    }
+
+    const payloadStart = 7;
+    const availablePayloadBytes = Math.max(
+      0,
+      Math.min(this.payloadLength, this.bytes.length - payloadStart)
+    );
+
+    let emitted = 0;
+    while (this.emittedPayloadBytes < availablePayloadBytes && emitted < maxToEmit) {
+      const payloadIndex = this.emittedPayloadBytes;
+      const payloadByte = this.bytes[payloadStart + payloadIndex];
+      this.callbacks.onPayloadByte(payloadIndex, payloadByte, this.payloadLength);
+      this.emittedPayloadBytes += 1;
+      emitted += 1;
+    }
+  }
+
   handleByte(byte) {
     this.bytes.push(byte);
 
@@ -626,17 +799,7 @@ class AcousticSstvDecoder {
       return;
     }
 
-    const payloadStart = 7;
-    const availablePayloadBytes = Math.max(
-      0,
-      Math.min(this.payloadLength, this.bytes.length - payloadStart)
-    );
-    while (this.emittedPayloadBytes < availablePayloadBytes) {
-      const payloadIndex = this.emittedPayloadBytes;
-      const payloadByte = this.bytes[payloadStart + payloadIndex];
-      this.callbacks.onPayloadByte(payloadIndex, payloadByte, this.payloadLength);
-      this.emittedPayloadBytes += 1;
-    }
+    this.flushBufferedPayload(MAX_PAYLOAD_EMIT_PER_CALL);
 
     if (this.bytes.length >= this.expectedTotal) {
       let checksum = 0;
@@ -661,10 +824,12 @@ class AcousticSstvDecoder {
     }
   }
 
-  decodeSymbols() {
-    while (this.decodeCursor + this.symbolSamples <= this.samples.length) {
+  decodeSymbols(maxSymbols) {
+    let processed = 0;
+    while (this.decodeCursor + this.symbolSamples <= this.samples.length && processed < maxSymbols) {
       const nibble = this.classifyNibble(this.decodeCursor);
       this.decodeCursor += this.symbolSamples;
+      processed += 1;
 
       if (nibble === null) {
         this.invalidSymbols += 1;
@@ -694,11 +859,15 @@ function onFrameStart(width, height) {
   liveCanvas.width = width;
   liveCanvas.height = height;
   liveCtx.imageSmoothingEnabled = false;
+  decodeWrap.classList.add("active");
 
   liveImageData = liveCtx.createImageData(width, height);
   for (let i = 3; i < liveImageData.data.length; i += 4) {
     liveImageData.data[i] = 255;
   }
+  lastProgressUiAt = 0;
+  liveRenderScheduled = false;
+  setDecodeRow(0);
   liveCtx.putImageData(liveImageData, 0, 0);
 }
 
@@ -712,13 +881,24 @@ function onPayloadByte(payloadIndex, value, payloadLength) {
   liveImageData.data[offset] = value;
 
   const shouldDrawRow = channel === 2 && (pixel + 1) % liveFrameWidth === 0;
-  const shouldDrawPulse = payloadIndex % 180 === 0;
+  const shouldDrawPulse = payloadIndex % 220 === 0;
   if (shouldDrawRow || shouldDrawPulse) {
-    liveCtx.putImageData(liveImageData, 0, 0);
+    scheduleLiveRender();
+  }
+
+  if (channel === 2 && liveFrameWidth > 0) {
+    const row = Math.floor(pixel / liveFrameWidth);
+    if (row !== currentDecodeRow) {
+      setDecodeRow(row);
+    }
   }
 
   const pct = Math.min(100, Math.round(((payloadIndex + 1) / payloadLength) * 100));
-  receiveProgress.textContent = `Progression: ${pct}%`;
+  const now = performance.now();
+  if (pct === 100 || now - lastProgressUiAt >= UI_PROGRESS_INTERVAL_MS) {
+    receiveProgress.textContent = `Progression: ${pct}%`;
+    lastProgressUiAt = now;
+  }
 }
 
 async function startReceiver() {
@@ -773,7 +953,17 @@ async function startReceiver() {
     sinkGainNode.gain.value = 0;
 
     decoder = new AcousticSstvDecoder(rxAudioCtx.sampleRate, SYMBOL_MS, {
-      onStatus: (text, isError) => setStatus(receiveStatus, text, isError),
+      onStatus: (text, isError) => {
+        setStatus(receiveStatus, text, isError);
+        const lower = String(text).toLowerCase();
+        if (lower.includes("signal detecte") || lower.includes("decodage")) {
+          setStageChip(recvStageChip, "Recever: decodage", "active");
+        } else if (lower.includes("image recue")) {
+          setStageChip(recvStageChip, "Recever: image recue", "active");
+        } else if (lower.includes("signal perdu") || lower.includes("invalide")) {
+          setStageChip(recvStageChip, "Recever: recherche", "warn");
+        }
+      },
       onSync: (count) => {
         if (decoder && !decoder.expectedTotal) {
           receiveProgress.textContent = `Sync entete: ${Math.max(0, Math.min(7, count))}/7`;
@@ -781,6 +971,9 @@ async function startReceiver() {
       },
       onProgress: (pct) => {
         receiveProgress.textContent = `Progression: ${Math.max(0, Math.min(100, pct))}%`;
+        if (pct >= 100) {
+          scheduleLiveRender();
+        }
       },
       onFrameStart,
       onPayloadByte
@@ -805,7 +998,10 @@ async function startReceiver() {
         return;
       }
       const input = event.inputBuffer.getChannelData(0);
-      drawAudioScope(input);
+      scopeDrawToggle = (scopeDrawToggle + 1) % 2;
+      if (scopeDrawToggle === 0) {
+        drawAudioScope(input);
+      }
 
       if (!calibrationComplete) {
         const remaining = calibrationTargetSamples - calibrationCollected;
@@ -878,12 +1074,17 @@ async function startReceiver() {
 
     setStatus(receiveStatus, "Micro actif. Calibration bruit ambiant pendant 2 secondes...", false);
     receiveProgress.textContent = "Calibration: 0%";
+    receiveMeta.textContent = "Ligne decodee: 0";
     drawPlaceholder(liveCtx, "Calibration 2 secondes");
     drawPlaceholder(audioScopeCtx, "Micro en direct");
     audioLevel.textContent = "Niveau micro: 0%";
+    decodeWrap.classList.remove("active");
+    decodeLine.style.transform = "translateY(0%)";
+    setStageChip(recvStageChip, "Recever: ecoute", "active");
   } catch (error) {
     stopReceiver();
     setStatus(receiveStatus, `Erreur micro: ${error.message}`, true);
+    setStageChip(recvStageChip, "Recever: erreur", "warn");
   }
 }
 
@@ -922,6 +1123,14 @@ function stopReceiver() {
   currentMicLevelPct = 0;
   weakSignalWarned = false;
   decoder = null;
+  liveImageData = null;
+  liveRenderScheduled = false;
+  scopeDrawToggle = 0;
+  currentDecodeRow = 0;
+  receiveMeta.textContent = "Ligne decodee: 0";
+  decodeWrap.classList.remove("active");
+  decodeLine.style.transform = "translateY(0%)";
+  setStageChip(recvStageChip, "Recever: idle", "idle");
   drawPlaceholder(audioScopeCtx, "Micro inactif");
   audioLevel.textContent = "Niveau micro: 0%";
 }
@@ -929,6 +1138,7 @@ function stopReceiver() {
 async function emitImage() {
   if (!selectedImage) {
     setStatus(emitStatus, "Choisis une image avant Emmiter.", true);
+    setStageChip(emitStageChip, "Emmiter: image manquante", "warn");
     return;
   }
   if (isEmitting) {
@@ -942,9 +1152,12 @@ async function emitImage() {
   const etaSec = (tones.length * SYMBOL_MS) / 1000;
   const volumePct = Number(emitVolume.value || 92);
   const outputGain = Math.max(0.08, Math.min(0.85, volumePct / 120));
+  let emitFailed = false;
 
   isEmitting = true;
   emitBtn.disabled = true;
+  setStageChip(emitStageChip, "Emmiter: emission", "active");
+  startEmitAnimation(payload, preset.width, preset.height, packet.length, tones.length, SYMBOL_MS);
   setStatus(
     emitStatus,
     `Emission en cours (${preset.width}x${preset.height}, ~${etaSec.toFixed(1)}s, volume ${volumePct}%)...`,
@@ -953,10 +1166,18 @@ async function emitImage() {
 
   try {
     await playToneSequence(tones, SYMBOL_MS, outputGain);
+    stopEmitAnimation(true);
     setStatus(emitStatus, "Emission terminee.", false);
+    setStageChip(emitStageChip, "Emmiter: emission terminee", "active");
   } catch (error) {
+    emitFailed = true;
+    stopEmitAnimation(false);
     setStatus(emitStatus, `Erreur emission: ${error.message}`, true);
+    setStageChip(emitStageChip, "Emmiter: erreur", "warn");
   } finally {
+    if (!emitFailed && emitAnimationState) {
+      stopEmitAnimation(true);
+    }
     emitBtn.disabled = false;
     isEmitting = false;
   }
@@ -970,6 +1191,8 @@ imageInput.addEventListener("change", async () => {
   if (!file) {
     selectedImage = null;
     drawPreview(null);
+    resetEmitLiveFrame("Pret a emettre");
+    setStageChip(emitStageChip, "Emmiter: idle", "idle");
     setStatus(emitStatus, "Choisis une image puis clique sur Emmiter.", false);
     return;
   }
@@ -977,10 +1200,14 @@ imageInput.addEventListener("change", async () => {
   try {
     selectedImage = await loadImageFromFile(file);
     drawPreview(selectedImage);
+    resetEmitLiveFrame("Attente emission");
+    setStageChip(emitStageChip, "Emmiter: image chargee", "active");
     setStatus(emitStatus, "Image chargee. Tu peux cliquer sur Emmiter.", false);
   } catch (error) {
     selectedImage = null;
     drawPreview(null);
+    resetEmitLiveFrame("Image invalide");
+    setStageChip(emitStageChip, "Emmiter: erreur image", "warn");
     setStatus(emitStatus, `Image invalide: ${error.message}`, true);
   }
 });
@@ -997,9 +1224,12 @@ stopBtn.addEventListener("click", () => {
   drawPlaceholder(liveCtx, "Signal en attente");
   drawPlaceholder(audioScopeCtx, "Micro inactif");
   audioLevel.textContent = "Niveau micro: 0%";
+  receiveProgress.textContent = "Progression: 0%";
+  receiveMeta.textContent = "Ligne decodee: 0";
 });
 
 window.addEventListener("beforeunload", () => {
+  stopEmitAnimation(false);
   stopReceiver();
   if (selectedImageUrl) {
     URL.revokeObjectURL(selectedImageUrl);
@@ -1009,3 +1239,6 @@ window.addEventListener("beforeunload", () => {
 drawPlaceholder(previewCtx, "Aucune image");
 drawPlaceholder(liveCtx, "Signal en attente");
 drawPlaceholder(audioScopeCtx, "Micro inactif");
+resetEmitLiveFrame("Pret a emettre");
+setStageChip(emitStageChip, "Emmiter: idle", "idle");
+setStageChip(recvStageChip, "Recever: idle", "idle");
