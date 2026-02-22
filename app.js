@@ -14,6 +14,7 @@ const PROTOCOL = {
 
 const SYMBOL_MS = 3.2;
 const CALIBRATION_SECONDS = 2;
+const LOCK_FALLBACK_SECONDS = 6;
 
 const PRESETS = {
   fast: { width: 24, height: 18 },
@@ -62,6 +63,8 @@ let calibrationSamples = null;
 let calibrationTargetSamples = 0;
 let calibrationCollected = 0;
 let calibrationComplete = false;
+let noLockSeconds = 0;
+let fallbackNoiseDisabled = false;
 
 let liveFrameWidth = 0;
 let liveFrameHeight = 0;
@@ -260,6 +263,30 @@ function goertzelPower(samples, start, size, freq, sampleRate) {
   return q1 * q1 + q2 * q2 - coeff * q1 * q2;
 }
 
+function normalizeInputChunk(input) {
+  let energy = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    energy += input[i] * input[i];
+  }
+  const rms = Math.sqrt(energy / Math.max(1, input.length));
+  if (rms <= 0) {
+    return input;
+  }
+
+  const targetRms = 0.06;
+  const gain = Math.min(12, targetRms / rms);
+  if (gain <= 1.35) {
+    return input;
+  }
+
+  const out = new Float32Array(input.length);
+  for (let i = 0; i < input.length; i += 1) {
+    const sample = input[i] * gain;
+    out[i] = Math.max(-1, Math.min(1, sample));
+  }
+  return out;
+}
+
 class AcousticSstvDecoder {
   constructor(sampleRate, symbolMs, callbacks) {
     this.sampleRate = sampleRate;
@@ -310,6 +337,10 @@ class AcousticSstvDecoder {
     return true;
   }
 
+  disableNoiseProfile() {
+    this.noiseReady = false;
+  }
+
   adjustedPower(start, freq) {
     const rawPower = goertzelPower(
       this.samples,
@@ -325,7 +356,7 @@ class AcousticSstvDecoder {
     if (floor <= 0) {
       return rawPower;
     }
-    return Math.max(0, rawPower - floor * 1.15);
+    return Math.max(0, rawPower - floor * 0.7);
   }
 
   resetToSearch(statusText, isError) {
@@ -377,7 +408,7 @@ class AcousticSstvDecoder {
 
     const step = Math.max(4, Math.floor(this.symbolSamples / 4));
     const maxOffset = this.samples.length - needSamples;
-    const minScore = Math.floor(PROTOCOL.preambleSymbols * 0.8);
+    const minScore = Math.floor(PROTOCOL.preambleSymbols * 0.65);
     let best = null;
 
     for (let offset = this.scanStart; offset <= maxOffset; offset += step) {
@@ -387,7 +418,7 @@ class AcousticSstvDecoder {
         const pA = this.adjustedPower(start, PROTOCOL.preambleA);
         const pB = this.adjustedPower(start, PROTOCOL.preambleB);
         const expectA = i % 2 === 0;
-        if ((expectA && pA > pB * 1.2) || (!expectA && pB > pA * 1.2)) {
+        if ((expectA && pA > pB * 1.08) || (!expectA && pB > pA * 1.08)) {
           preambleScore += 1;
         }
       }
@@ -402,12 +433,12 @@ class AcousticSstvDecoder {
         const pS = this.adjustedPower(start, PROTOCOL.startFreq);
         const pA = this.adjustedPower(start, PROTOCOL.preambleA);
         const pB = this.adjustedPower(start, PROTOCOL.preambleB);
-        if (pS > Math.max(pA, pB) * 1.2) {
+        if (pS > Math.max(pA, pB) * 1.08) {
           startScore += 1;
         }
       }
 
-      if (startScore < PROTOCOL.startSymbols - 1) {
+      if (startScore < 2) {
         continue;
       }
 
@@ -451,7 +482,7 @@ class AcousticSstvDecoder {
     }
 
     const confidence = bestPower / (secondPower + 1e-9);
-    if (bestPower <= 0 || confidence < 1.05) {
+    if (confidence < 1.02) {
       return null;
     }
     return bestNibble;
@@ -644,6 +675,8 @@ async function startReceiver() {
     calibrationSamples = new Float32Array(calibrationTargetSamples);
     calibrationCollected = 0;
     calibrationComplete = false;
+    noLockSeconds = 0;
+    fallbackNoiseDisabled = false;
 
     processorNode.onaudioprocess = (event) => {
       if (!decoder) {
@@ -675,6 +708,7 @@ async function startReceiver() {
             setStatus(receiveStatus, "Calibration trop courte. En attente du signal SSTV...", true);
           }
           receiveProgress.textContent = "Progression: 0%";
+          drawPlaceholder(liveCtx, "En attente du signal");
 
           if (take < input.length) {
             const tail = input.subarray(take);
@@ -685,8 +719,25 @@ async function startReceiver() {
         return;
       }
 
-      decoder.append(input);
+      const normalizedInput = normalizeInputChunk(input);
+      decoder.append(normalizedInput);
       decoder.process();
+
+      if (!decoder.locked) {
+        noLockSeconds += input.length / rxAudioCtx.sampleRate;
+        if (!fallbackNoiseDisabled && decoder.noiseReady && noLockSeconds >= LOCK_FALLBACK_SECONDS) {
+          decoder.disableNoiseProfile();
+          fallbackNoiseDisabled = true;
+          setStatus(
+            receiveStatus,
+            "Mode compatibilite active: calibration bruit desactivee pour mieux detecter le signal.",
+            false
+          );
+          drawPlaceholder(liveCtx, "Mode compatibilite actif");
+        }
+      } else {
+        noLockSeconds = 0;
+      }
     };
 
     micSourceNode.connect(processorNode);
@@ -695,6 +746,7 @@ async function startReceiver() {
 
     setStatus(receiveStatus, "Micro actif. Calibration bruit ambiant pendant 2 secondes...", false);
     receiveProgress.textContent = "Calibration: 0%";
+    drawPlaceholder(liveCtx, "Calibration 2 secondes");
   } catch (error) {
     stopReceiver();
     setStatus(receiveStatus, `Erreur micro: ${error.message}`, true);
@@ -729,6 +781,8 @@ function stopReceiver() {
   calibrationTargetSamples = 0;
   calibrationCollected = 0;
   calibrationComplete = false;
+  noLockSeconds = 0;
+  fallbackNoiseDisabled = false;
   decoder = null;
 }
 
@@ -794,6 +848,7 @@ listenBtn.addEventListener("click", startReceiver);
 stopBtn.addEventListener("click", () => {
   stopReceiver();
   setStatus(receiveStatus, "Recever arrete.", false);
+  drawPlaceholder(liveCtx, "Signal en attente");
 });
 
 window.addEventListener("beforeunload", () => {
