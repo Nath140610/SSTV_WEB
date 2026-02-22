@@ -35,6 +35,8 @@ const TRACKED_FREQS = (() => {
 
 const imageInput = document.getElementById("imageInput");
 const qualitySelect = document.getElementById("qualitySelect");
+const emitVolume = document.getElementById("emitVolume");
+const emitVolumeLabel = document.getElementById("emitVolumeLabel");
 const emitBtn = document.getElementById("emitBtn");
 const emitStatus = document.getElementById("emitStatus");
 const previewCanvas = document.getElementById("previewCanvas");
@@ -77,6 +79,8 @@ let liveFrameHeight = 0;
 let liveImageData = null;
 let audioLevelSmooth = 0;
 let agcGain = 1;
+let currentMicLevelPct = 0;
+let weakSignalWarned = false;
 
 function setStatus(element, text, isError) {
   element.textContent = text;
@@ -114,6 +118,7 @@ function drawAudioScope(samples) {
   const rms = Math.sqrt(energy / Math.max(1, samples.length));
   audioLevelSmooth = audioLevelSmooth * 0.88 + rms * 0.12;
   const levelPct = Math.min(100, Math.round(audioLevelSmooth * 700));
+  currentMicLevelPct = levelPct;
   audioLevel.textContent = `Niveau micro: ${levelPct}%`;
 
   audioScopeCtx.strokeStyle = "#3fe0c0";
@@ -255,7 +260,7 @@ function packetToTones(packet) {
   return tones;
 }
 
-async function playToneSequence(tones, symbolMs) {
+async function playToneSequence(tones, symbolMs, outputGain) {
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   const audioCtx = new AudioCtx();
   await audioCtx.resume();
@@ -274,9 +279,10 @@ async function playToneSequence(tones, symbolMs) {
     oscillator.frequency.setValueAtTime(tones[i], startTime + i * symbolDuration);
   }
 
+  const amp = Math.max(0.05, Math.min(0.85, outputGain));
   gain.gain.setValueAtTime(0, startTime - 0.02);
-  gain.gain.linearRampToValueAtTime(0.22, startTime);
-  gain.gain.setValueAtTime(0.22, endTime - 0.01);
+  gain.gain.linearRampToValueAtTime(amp, startTime);
+  gain.gain.setValueAtTime(amp, endTime - 0.01);
   gain.gain.linearRampToValueAtTime(0, endTime);
 
   return await new Promise((resolve) => {
@@ -791,6 +797,8 @@ async function startReceiver() {
     fallbackNoiseDisabled = false;
     audioLevelSmooth = 0;
     agcGain = 1;
+    currentMicLevelPct = 0;
+    weakSignalWarned = false;
 
     processorNode.onaudioprocess = (event) => {
       if (!decoder) {
@@ -840,6 +848,14 @@ async function startReceiver() {
 
       if (!decoder.locked) {
         noLockSeconds += input.length / rxAudioCtx.sampleRate;
+        if (!weakSignalWarned && noLockSeconds >= 2.5 && currentMicLevelPct < 3) {
+          weakSignalWarned = true;
+          setStatus(
+            receiveStatus,
+            "Signal trop faible. Monte le volume emmeteur et rapproche le micro du haut-parleur.",
+            true
+          );
+        }
         if (!fallbackNoiseDisabled && decoder.noiseReady && noLockSeconds >= LOCK_FALLBACK_SECONDS) {
           decoder.disableNoiseProfile();
           fallbackNoiseDisabled = true;
@@ -852,6 +868,7 @@ async function startReceiver() {
         }
       } else {
         noLockSeconds = 0;
+        weakSignalWarned = false;
       }
     };
 
@@ -902,6 +919,8 @@ function stopReceiver() {
   fallbackNoiseDisabled = false;
   audioLevelSmooth = 0;
   agcGain = 1;
+  currentMicLevelPct = 0;
+  weakSignalWarned = false;
   decoder = null;
   drawPlaceholder(audioScopeCtx, "Micro inactif");
   audioLevel.textContent = "Niveau micro: 0%";
@@ -921,17 +940,19 @@ async function emitImage() {
   const packet = buildPacket(payload, preset.width, preset.height);
   const tones = packetToTones(packet);
   const etaSec = (tones.length * SYMBOL_MS) / 1000;
+  const volumePct = Number(emitVolume.value || 92);
+  const outputGain = Math.max(0.08, Math.min(0.85, volumePct / 120));
 
   isEmitting = true;
   emitBtn.disabled = true;
   setStatus(
     emitStatus,
-    `Emission en cours (${preset.width}x${preset.height}, ~${etaSec.toFixed(1)}s)...`,
+    `Emission en cours (${preset.width}x${preset.height}, ~${etaSec.toFixed(1)}s, volume ${volumePct}%)...`,
     false
   );
 
   try {
-    await playToneSequence(tones, SYMBOL_MS);
+    await playToneSequence(tones, SYMBOL_MS, outputGain);
     setStatus(emitStatus, "Emission terminee.", false);
   } catch (error) {
     setStatus(emitStatus, `Erreur emission: ${error.message}`, true);
@@ -962,6 +983,10 @@ imageInput.addEventListener("change", async () => {
     drawPreview(null);
     setStatus(emitStatus, `Image invalide: ${error.message}`, true);
   }
+});
+
+emitVolume.addEventListener("input", () => {
+  emitVolumeLabel.textContent = `${emitVolume.value}%`;
 });
 
 emitBtn.addEventListener("click", emitImage);

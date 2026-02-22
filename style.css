@@ -92,6 +92,11 @@ select {
   width: 100%;
 }
 
+input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
 .canvas-wrap {
   border-radius: 12px;
   overflow: hidden;
