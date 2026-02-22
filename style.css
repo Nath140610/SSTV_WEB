@@ -255,6 +255,30 @@ canvas {
   margin-bottom: 12px;
 }
 
+.sensitivity-modes {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.sens-btn {
+  flex: 1;
+  border: 1px solid rgba(57, 244, 230, 0.45);
+  border-radius: 9px;
+  background: rgba(9, 18, 31, 0.75);
+  color: #d6fbff;
+  padding: 9px 8px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.sens-btn.active {
+  border-color: rgba(255, 211, 106, 0.9);
+  background: linear-gradient(120deg, rgba(255, 77, 155, 0.78), rgba(255, 143, 47, 0.82));
+  color: #fff;
+  box-shadow: 0 0 18px rgba(255, 143, 47, 0.26);
+}
+
 .primary,
 #stopBtn {
   border: none;
@@ -320,6 +344,10 @@ canvas {
   }
 
   .actions {
+    flex-direction: column;
+  }
+
+  .sensitivity-modes {
     flex-direction: column;
   }
 }

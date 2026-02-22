@@ -23,6 +23,7 @@ const MAX_PAYLOAD_EMIT_PER_CALL = 220;
 const MAX_SAMPLE_BUFFER_SECONDS = 14;
 const TRIM_SAMPLE_BUFFER_SECONDS = 8;
 const UI_PROGRESS_INTERVAL_MS = 80;
+const EMIT_SAMPLE_RATE = 48000;
 
 const PRESETS = {
   fast: { width: 24, height: 18 },
@@ -37,6 +38,12 @@ const TRACKED_FREQS = (() => {
   }
   return freqs;
 })();
+
+const SENSITIVITY_PRESETS = {
+  low: 75,
+  normal: 100,
+  extra: 180
+};
 
 const imageInput = document.getElementById("imageInput");
 const qualitySelect = document.getElementById("qualitySelect");
@@ -55,6 +62,9 @@ const listenBtn = document.getElementById("listenBtn");
 const stopBtn = document.getElementById("stopBtn");
 const sensitivityRange = document.getElementById("sensitivityRange");
 const sensitivityLabel = document.getElementById("sensitivityLabel");
+const sensLowBtn = document.getElementById("sensLowBtn");
+const sensNormalBtn = document.getElementById("sensNormalBtn");
+const sensExtraBtn = document.getElementById("sensExtraBtn");
 const receiveStatus = document.getElementById("receiveStatus");
 const receiveProgress = document.getElementById("receiveProgress");
 const receiveMeta = document.getElementById("receiveMeta");
@@ -129,6 +139,37 @@ function drawPlaceholder(canvasCtx, message) {
 function getSensitivityScaleFromUi() {
   const pct = Number(sensitivityRange.value || 100);
   return Math.max(0.5, Math.min(2.5, pct / 100));
+}
+
+function setSensitivityModeButtons(activeMode) {
+  sensLowBtn.classList.toggle("active", activeMode === "low");
+  sensNormalBtn.classList.toggle("active", activeMode === "normal");
+  sensExtraBtn.classList.toggle("active", activeMode === "extra");
+}
+
+function inferSensitivityModeFromRange() {
+  const value = Number(sensitivityRange.value || 100);
+  if (value <= 87) {
+    return "low";
+  }
+  if (value >= 145) {
+    return "extra";
+  }
+  return "normal";
+}
+
+function applySensitivityFromRange() {
+  sensitivityScale = getSensitivityScaleFromUi();
+  sensitivityLabel.textContent = `${sensitivityRange.value}%`;
+  setSensitivityModeButtons(inferSensitivityModeFromRange());
+}
+
+function applySensitivityPreset(modeKey) {
+  const preset = SENSITIVITY_PRESETS[modeKey] || SENSITIVITY_PRESETS.normal;
+  sensitivityRange.value = String(preset);
+  sensitivityScale = getSensitivityScaleFromUi();
+  sensitivityLabel.textContent = `${sensitivityRange.value}%`;
+  setSensitivityModeButtons(modeKey);
 }
 
 function resetEmitLiveFrame(message) {
@@ -419,31 +460,60 @@ function packetToTones(packet) {
 
 async function playToneSequence(tones, symbolMs, outputGain) {
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
-  const audioCtx = new AudioCtx();
+  let audioCtx;
+  try {
+    audioCtx = new AudioCtx({
+      latencyHint: "interactive",
+      sampleRate: EMIT_SAMPLE_RATE
+    });
+  } catch (_) {
+    audioCtx = new AudioCtx();
+  }
   await audioCtx.resume();
 
-  const oscillator = audioCtx.createOscillator();
-  const gain = audioCtx.createGain();
-  oscillator.type = "sine";
-  oscillator.connect(gain);
-  gain.connect(audioCtx.destination);
+  const sampleRate = audioCtx.sampleRate;
+  const symbolSamples = Math.max(1, Math.round((symbolMs / 1000) * sampleRate));
+  const leadInSamples = Math.round(sampleRate * 0.03);
+  const tailSamples = Math.round(sampleRate * 0.03);
+  const totalSamples = leadInSamples + tones.length * symbolSamples + tailSamples;
+  const buffer = audioCtx.createBuffer(1, totalSamples, sampleRate);
+  const data = buffer.getChannelData(0);
 
-  const symbolDuration = symbolMs / 1000;
-  const startTime = audioCtx.currentTime + 0.08;
-  const endTime = startTime + tones.length * symbolDuration;
-
-  for (let i = 0; i < tones.length; i += 1) {
-    oscillator.frequency.setValueAtTime(tones[i], startTime + i * symbolDuration);
+  // Emission "brute": PCM direct pour limiter tout traitement intermediaire cote navigateur.
+  let phase = 0;
+  let write = leadInSamples;
+  for (let t = 0; t < tones.length; t += 1) {
+    const freq = tones[t];
+    const phaseInc = (2 * Math.PI * freq) / sampleRate;
+    for (let n = 0; n < symbolSamples && write < totalSamples - tailSamples; n += 1) {
+      phase += phaseInc;
+      if (phase > Math.PI * 2) {
+        phase -= Math.PI * 2;
+      }
+      data[write++] = Math.sin(phase);
+    }
   }
 
+  const fadeSamples = Math.max(24, Math.round(sampleRate * 0.002));
+  for (let i = 0; i < fadeSamples && i < data.length; i += 1) {
+    const inGain = i / fadeSamples;
+    const outIndex = data.length - 1 - i;
+    const outGain = i / fadeSamples;
+    data[i] *= inGain;
+    data[outIndex] *= outGain;
+  }
+
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  const gain = audioCtx.createGain();
+  source.connect(gain);
+  gain.connect(audioCtx.destination);
+
   const amp = Math.max(0.05, Math.min(0.85, outputGain));
-  gain.gain.setValueAtTime(0, startTime - 0.02);
-  gain.gain.linearRampToValueAtTime(amp, startTime);
-  gain.gain.setValueAtTime(amp, endTime - 0.01);
-  gain.gain.linearRampToValueAtTime(0, endTime);
+  gain.gain.value = amp;
 
   return await new Promise((resolve) => {
-    oscillator.onended = async () => {
+    source.onended = async () => {
       try {
         await audioCtx.close();
       } catch (_) {
@@ -451,8 +521,7 @@ async function playToneSequence(tones, symbolMs, outputGain) {
       resolve();
     };
 
-    oscillator.start(startTime - 0.02);
-    oscillator.stop(endTime + 0.02);
+    source.start();
   });
 }
 
@@ -1182,7 +1251,7 @@ async function emitImage() {
   startEmitAnimation(payload, preset.width, preset.height, packet.length, tones.length, SYMBOL_MS);
   setStatus(
     emitStatus,
-    `Emission en cours (${preset.width}x${preset.height}, ~${etaSec.toFixed(1)}s, volume ${volumePct}%)...`,
+    `Emission en cours (${preset.width}x${preset.height}, ~${etaSec.toFixed(1)}s, volume ${volumePct}%, mode brut)...`,
     false
   );
 
@@ -1239,8 +1308,19 @@ emitVolume.addEventListener("input", () => {
 });
 
 sensitivityRange.addEventListener("input", () => {
-  sensitivityLabel.textContent = `${sensitivityRange.value}%`;
-  sensitivityScale = getSensitivityScaleFromUi();
+  applySensitivityFromRange();
+});
+
+sensLowBtn.addEventListener("click", () => {
+  applySensitivityPreset("low");
+});
+
+sensNormalBtn.addEventListener("click", () => {
+  applySensitivityPreset("normal");
+});
+
+sensExtraBtn.addEventListener("click", () => {
+  applySensitivityPreset("extra");
 });
 
 emitBtn.addEventListener("click", emitImage);
@@ -1267,7 +1347,6 @@ drawPlaceholder(previewCtx, "Aucune image");
 drawPlaceholder(liveCtx, "Signal en attente");
 drawPlaceholder(audioScopeCtx, "Micro inactif");
 resetEmitLiveFrame("Pret a emettre");
-sensitivityScale = getSensitivityScaleFromUi();
-sensitivityLabel.textContent = `${sensitivityRange.value}%`;
+applySensitivityFromRange();
 setStageChip(emitStageChip, "Emmiter: idle", "idle");
 setStageChip(recvStageChip, "Recever: idle", "idle");

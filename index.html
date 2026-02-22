@@ -76,6 +76,11 @@
         <span>Sensibilite recever: <strong id="sensitivityLabel">100%</strong></span>
         <input id="sensitivityRange" type="range" min="50" max="250" step="5" value="100">
       </label>
+      <div class="sensitivity-modes">
+        <button id="sensLowBtn" class="sens-btn" type="button">Pas sensible</button>
+        <button id="sensNormalBtn" class="sens-btn active" type="button">Sensible</button>
+        <button id="sensExtraBtn" class="sens-btn" type="button">Extra sensible</button>
+      </div>
 
       <div class="scope-wrap">
         <canvas id="audioScope" width="800" height="160"></canvas>
